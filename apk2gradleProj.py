@@ -192,7 +192,7 @@ def decompile_jar(jar_file: Path):
             "-ren=1"
         ]
     )
-    cmd.extend(fernflower_libs)
+    cmd.extend([ref for ref in fernflower_libs if not ref == "-e=" + jar_file.absolute().as_posix()])
     cmd.extend([
         jar_file.absolute().as_posix(),
         decompile_jar_path.absolute().as_posix()
