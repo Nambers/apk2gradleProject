@@ -4,10 +4,15 @@
 # Description: Converts an apk to a gradle project
 # License: MIT
 
-import tqdm, os, hashlib, stat, platform, zipfile, subprocess, datetime
+import platform, datetime
 from shutil import copyfile, unpack_archive
-from multiprocessing import Pool
 from pathlib import Path
+from time import sleep
+from tqdm import tqdm
+from stat import S_IEXEC
+from zipfile import ZipFile
+from subprocess import Popen, PIPE
+from hashlib import sha1
 
 # Configure:
 dex2jar_path = Path("dex2jar.zip")
@@ -17,28 +22,14 @@ projTemplate_path = Path("ProjectTemplate.zip")
 output_path = Path("output")
 dex2jar_threads = 5
 fernflower_threads = 5
-fernflower_jvm_args = []
-
-# path helpers
-dex2jar_unzip_path = output_path.joinpath("dex2jar")
-if platform.system() == "Windows":
-    dex2jar_bin_file = dex2jar_unzip_path.joinpath("d2j-dex2jar.bat")
-else:
-    dex2jar_bin_file = dex2jar_unzip_path.joinpath("d2j-dex2jar.sh")
-fernflower_unzip_file = output_path.joinpath("fernflower.jar")
-project_unzip_path = output_path.joinpath(os.path.basename(apk_path))
-apk_unzip_path = output_path.joinpath("apk_unzipped")
-jars_path = output_path.joinpath("jars")
-decompile_jar_path = output_path.joinpath("decompiledJars")
-
-fernflower_libs = []
+fernflower_jvm_args = ["-Xmx" + str(int(20 * 1024 / fernflower_threads)) + "m"]
 
 def hash_file(filename):
     """ "This function returns the SHA-1 hash
     of the file passed into it"""
 
     # make a hash object
-    h = hashlib.sha1()
+    h = sha1()
 
     # open file for reading in binary mode
     with open(filename, "rb") as file:
@@ -90,7 +81,7 @@ def expandArchives():
             unpack_archive(dex2jar_path, dex2jar_unzip_path)
             f.write(hash_file(dex2jar_path))
             # chmod +x dex2jar_bin_file
-            dex2jar_bin_file.chmod(dex2jar_bin_file.stat().st_mode | stat.S_IEXEC)
+            dex2jar_bin_file.chmod(dex2jar_bin_file.stat().st_mode | S_IEXEC)
             print("[+] Extracted dex2jar.zip")
         else:
             print("[-] Skipping dex2jar.zip")
@@ -122,7 +113,7 @@ def expandArchives():
             if len(sha) != 0:
                 remove_directory_tree(apk_unzip_path)
                 print("[-] Removed old unzipped apk")
-            with zipfile.ZipFile(apk_path, "r") as zip_ref:
+            with ZipFile(apk_path, "r") as zip_ref:
                 for file_info in zip_ref.infolist():
                     if file_info.filename.endswith(".dex"):
                         zip_ref.extract(file_info, path=apk_unzip_path)
@@ -130,6 +121,46 @@ def expandArchives():
             print("[+] Extracted", apk_path.absolute())
         else:
             print("[-] Skipping", apk_path.absolute())
+
+
+def open_subprocess(func, arg, task_checker, tasks_per_round=5):
+    curr = tasks_count = 0
+    tasks: list[tuple(Popen, str)] = []
+    with tqdm(total=len(arg)) as pbar:
+        while True:
+            try:
+                while tasks_count < tasks_per_round:
+                    if curr == len(arg):
+                        break
+                    tasks.append((func(arg[curr]), arg[curr]))
+                    curr += 1
+                    tasks_count += 1
+                temp_tasks = []
+                for i in range(len(tasks)):
+                    if tasks[i][0].poll() is not None:
+                        pbar.update(1)
+                        tasks_count -= 1
+                        task_checker(tasks[i][0], tasks[i][1])
+                    else:
+                        temp_tasks.append(tasks[i])
+                tasks = temp_tasks
+                if len(tasks) == 0:
+                    break
+                # sleep 5 sec
+                sleep(5)
+            except KeyboardInterrupt as e:
+                print("[-] Caught KeyboardInterrupt, exiting current tasks...")
+                with open("KeyBoardInterrupt-" + datetime.datetime.now().strftime('%b-%d-%I%M%p-%G') + ".log", "w") as f:
+                    f.write("KeyboardInterrupt of " + func.__name__ + "\n\n")
+                    for task in tasks:
+                        print("[-] Killing pid=" + str(task[0].pid))
+                        task[0].kill()
+                        (stdout, stderr) = task[0].communicate()
+                        f.write("target:" + task[1].absolute().as_posix() + "\n")
+                        f.write("stdout:\n" + stdout.decode() + "\n")
+                        f.write("stderr:\n" + stderr.decode() + "\n")
+                        f.write("\n")
+                raise e
 
 
 def dex2jarSingle(dex_file: Path):
@@ -141,14 +172,23 @@ def dex2jarSingle(dex_file: Path):
         dex_file.absolute().as_posix(),
     ]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    proc.wait()
+    return Popen(cmd, stdout=PIPE, stderr=PIPE)
+
+def check_dex2jar_result(proc: Popen, dex_file: Path):
+    assert proc.poll() is not None
     (stdout, stderr) = proc.communicate()
 
     if proc.returncode != 0:
         print(stderr)
         with open("error" + dex_file.name + datetime.datetime.now().strftime('%b-%d-%I%M%p-%G') + ".log", "w") as f:
             f.write("time:" + datetime.datetime.now().strftime('%b-%d-%I%M%p-%G') + "\n")
+            cmd = [
+                dex2jar_bin_file.absolute().as_posix(),
+                "--force",
+                "-o",
+                jars_path.joinpath(dex_file.stem + ".jar").absolute().as_posix(),
+                dex_file.absolute().as_posix(),
+            ]
             f.write("cmd:" + str(cmd) + "\n")
             f.write("stderr:\n" + stderr.decode()  + "\n")
             f.write("stdout:\n" + stdout.decode() + "\n")
@@ -169,13 +209,11 @@ def dex2jar():
                     if sha.read() == hash_file(f):
                         continue
             files.append(f)
-    with Pool(processes=dex2jar_threads) as pool:
-        if len(files) == 0:
-            print("[-] Skipping Converting dex to jar")
-        else:
-            print("[*] Converting dex to jar...")
-            results = tqdm.tqdm(pool.imap_unordered(dex2jarSingle, files), total=len(files))
-            tuple(results)  # grab the results
+    if len(files) == 0:
+        print("[-] Skipping Converting dex to jar")
+    else:
+        print("[*] Converting dex to jar...")
+        open_subprocess(dex2jarSingle, files, check_dex2jar_result, dex2jar_threads)
 
 
 def decompile_jar(jar_file: Path):
@@ -198,15 +236,29 @@ def decompile_jar(jar_file: Path):
         decompile_jar_path.absolute().as_posix()
     ])
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    proc.wait()
+    return Popen(cmd, stdout=PIPE, stderr=PIPE)
+    
+
+def check_fernflower_result(proc: Popen, jar_file: Path, cmd: list):
+    assert proc.poll() is not None
     (stdout, stderr) = proc.communicate()
-
-
     if proc.returncode != 0:
         print(stderr.decode())
         with open("error" + jar_file.name + datetime.datetime.now().strftime('%b-%d-%I%M%p-%G') + ".log", "w") as f:
             f.write("time:" + datetime.datetime.now().strftime('%b-%d-%I%M%p-%G') + "\n")
+            cmd = ["java"]
+            cmd.extend(fernflower_jvm_args)
+            cmd.extend(
+                [
+                    "-jar",
+                    fernflower_unzip_file.absolute().as_posix(),
+                    "-dgs=1",
+                    "-log=ERROR",
+                    "-lit=1",
+                    "-mpm=300",
+                    "-ren=1"
+                ]
+            )
             f.write("cmd:" + str(cmd) + "\n")
             f.write("stderr:\n" + stderr.decode() + "\n")
             f.write("stdout:\n" + stdout.decode() + "\n")
@@ -217,9 +269,9 @@ def decompile_jar(jar_file: Path):
     with open(jarSHA, "w") as f:
         f.write(hash_file(jar_file))
 
-
 def decompile_jars():
     global fernflower_libs
+    fernflower_libs = []
     jar_files = []
     for f in jars_path.iterdir():
         if f.is_file and f.suffix == ".jar":
@@ -229,21 +281,29 @@ def decompile_jars():
                     if sha.read() == hash_file(f):
                         continue
             jar_files.append(f)
-    with Pool(processes=fernflower_threads) as pool:
-        print("[*] Decompiling jars")
-        results = tqdm.tqdm(
-            pool.imap_unordered(decompile_jar, jar_files), total=len(jar_files)
-        )
-        tuple(results)  # grab the results
+    print("[*] Decompiling jars")
+    open_subprocess(decompile_jar, jar_files, check_fernflower_result, fernflower_threads)
 
 
 def unzip_decompiled_jars():
     print("[*] Unzipping decompiled jars")
-    for f in tqdm.tqdm(decompile_jar_path.iterdir()):
+    for f in tqdm(decompile_jar_path.iterdir()):
         if f.is_file and f.suffix == ".jar":
             unpack_archive(f, project_unzip_path.joinpath("app/src/main/java"), "zip")
 
 if __name__ == "__main__":
+    # path helpers
+    dex2jar_unzip_path = output_path.joinpath("dex2jar")
+    if platform.system() == "Windows":
+        dex2jar_bin_file = dex2jar_unzip_path.joinpath("d2j-dex2jar.bat")
+    else:
+        dex2jar_bin_file = dex2jar_unzip_path.joinpath("d2j-dex2jar.sh")
+    fernflower_unzip_file = output_path.joinpath("fernflower.jar")
+    project_unzip_path = output_path.joinpath(apk_path.name)
+    apk_unzip_path = output_path.joinpath("apk_unzipped")
+    jars_path = output_path.joinpath("jars")
+    decompile_jar_path = output_path.joinpath("decompiledJars")
+
     print("[*] Starting apk2gradleProj.py")
     validPath()
     expandArchives()
