@@ -224,7 +224,7 @@ def decompile_jar(jar_file: Path):
             "-jar",
             fernflower_unzip_file.absolute().as_posix(),
             "-dgs=1",
-            "-log=ERROR",
+            "-log=TRACE",
             "-lit=1",
             "-mpm=300",
             "-ren=1"
@@ -239,8 +239,8 @@ def decompile_jar(jar_file: Path):
     return Popen(cmd, stdout=PIPE, stderr=PIPE)
     
 
-def check_fernflower_result(proc: Popen, jar_file: Path, cmd: list):
-    assert proc.poll() is not None
+def check_fernflower_result(proc: Popen, jar_file: Path):
+    assert proc.terminateproc.poll() is not None
     (stdout, stderr) = proc.communicate()
     if proc.returncode != 0:
         print(stderr.decode())
