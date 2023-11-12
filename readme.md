@@ -1,5 +1,5 @@
 # Apk to gradle project
-Inspected by autoapk2jar of Him188.  
+Inspaired by autoapk2jar of Him188.  
 
 ## Usage
 1. clone the project with depth=1  
